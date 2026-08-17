@@ -11,7 +11,7 @@
     --accent-hover: #7c3aed;
     --success-color: #10b981;
     --warning-color: #f59e0b;
-    --font-family: 'Inter', system-ui, -apple-system, sans-serif;
+    --font-family: system-ui, -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif;
     --sidebar-width: 280px;
     --bookmark-layout-grid-size: 24px;
     --bookmark-layout-edge-gap: calc(var(--bookmark-layout-grid-size) / 2);

@@ -6,6 +6,9 @@ class UserManager {
     constructor() {
         this.currentUser = null;
         this.API_BASE = '';
+        // 认证结果缓存：一次页面加载内 /api/users/check-auth 只请求一次，登录/登出后失效
+        this.authChecked = false;
+        this.authResult = null;
     }
 
     async login(username, password) {
@@ -20,6 +23,8 @@ class UserManager {
             const data = await response.json();
             if (data.success) {
                 this.currentUser = data.user;
+                this.authChecked = true;
+                this.authResult = { isLoggedIn: true, user: data.user };
                 return { success: true, user: data.user };
             } else {
                 return { success: false, error: data.error };
@@ -37,6 +42,8 @@ class UserManager {
                 credentials: 'include'
             });
             this.currentUser = null;
+            this.authChecked = false;
+            this.authResult = null;
             return { success: true };
         } catch (error) {
             console.error('[UserManager] Logout error:', error);
@@ -45,6 +52,10 @@ class UserManager {
     }
 
     async checkAuth() {
+        if (this.authChecked) {
+            return this.authResult;
+        }
+
         try {
             const response = await fetch(`${this.API_BASE}/api/users/check-auth`, {
                 credentials: 'include'
@@ -53,6 +64,8 @@ class UserManager {
             if (data.isLoggedIn) {
                 this.currentUser = data.user;
             }
+            this.authChecked = true;
+            this.authResult = data;
             return data;
         } catch (error) {
             console.error('[UserManager] Check auth error:', error);

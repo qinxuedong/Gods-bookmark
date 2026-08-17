@@ -385,6 +385,15 @@ async function initGlobalUI() {
         });
     }
 
+    // 并行发起配置与认证检查，避免串行等待（外网高延迟场景下尤为明显）
+    const authStatusPromise = dataManager.isLoggedIn().catch(() => false);
+    const userAuthPromise = window.userManager
+        ? window.userManager.checkAuth().catch((error) => {
+            console.error('[initGlobalUI] Error checking user auth:', error);
+            return null;
+        })
+        : Promise.resolve(null);
+
     try {
         // 加载并显示网站标题
         try {
@@ -431,24 +440,15 @@ async function initGlobalUI() {
             }
         });
 
-        // 检查登录状态，如果失败则默认显示登录链接
+        // 检查登录状态（promise 已在上方并行发起，此处等待结果）
         let isLoggedIn = false;
         try {
-            console.log('[initGlobalUI] Checking login status...');
-            isLoggedIn = await dataManager.isLoggedIn();
+            isLoggedIn = await authStatusPromise;
             console.log('[initGlobalUI] Login status:', isLoggedIn);
 
-            // 同时检查多用户认证状态，确保userManager.currentUser被设置
-            if (window.userManager) {
-                try {
-                    const authResult = await window.userManager.checkAuth();
-                    console.log('[initGlobalUI] User auth check result:', authResult);
-                    if (authResult && authResult.isLoggedIn && authResult.user) {
-                        console.log('[initGlobalUI] Current user:', authResult.user);
-                    }
-                } catch (error) {
-                    console.error('[initGlobalUI] Error checking user auth:', error);
-                }
+            const authResult = await userAuthPromise;
+            if (authResult && authResult.isLoggedIn && authResult.user) {
+                console.log('[initGlobalUI] Current user:', authResult.user);
             }
         } catch (error) {
             console.error('[initGlobalUI] Failed to check login status:', error);
@@ -1065,6 +1065,11 @@ async function refreshBookmarksFromRealtime(changeType) {
     bookmarksRealtimeRefreshTimer = window.setTimeout(async () => {
         bookmarksRealtimeRefreshTimer = null;
 
+        // 远端变更已到达，本地书签缓存立即失效，避免短缓存返回旧数据
+        if (window.dataManager && typeof window.dataManager.invalidateBookmarks === 'function') {
+            window.dataManager.invalidateBookmarks();
+        }
+
         try {
             console.log('[RealtimeSync] Refreshing bookmarks after change:', changeType);
             await loadBookmarks();
@@ -1169,21 +1174,22 @@ function setupBookmarksRealtimeSync() {
 
 /* --- Dashboard Logic --- */
 async function initDashboard() {
-    // 恢复主题设置（优先执行）
+    // 恢复主题设置（优先执行；配置已在 initGlobalUI 预取，此处命中缓存不再发请求）
     if (typeof window.restoreTheme === 'function') {
         await window.restoreTheme();
     }
 
-    await loadBookmarks();
-    await initMonitor();
+    // 并行加载互不依赖的模块：书签渲染、监控部件、常用标签栏
+    const bookmarksReady = loadBookmarks();
+    const monitorReady = initMonitor();
+    const frequentReady = loadFrequentBookmarks();
 
-    // 加载常用标签栏
-    await loadFrequentBookmarks();
+    await bookmarksReady;
 
-    // 初始化全局搜索（在加载书签后，确保缓存已更新）
+    // 初始化全局搜索（依赖书签数据，此时复用书签缓存，不再重复全量拉取）
     await initGlobalSearch();
 
-    // 检查用户认证状态（多用户模式）
+    // 检查用户认证状态（多用户模式，认证结果已缓存，无额外请求）
     if (window.userManager) {
         try {
             const authResult = await window.userManager.checkAuth();
@@ -1202,6 +1208,9 @@ async function initDashboard() {
         setupBookmarksRealtimeSync();
         await initTodos();
     }
+
+    // 等待并行模块完成
+    await Promise.all([monitorReady, frequentReady]);
 
     // 初始化滚动检测，为时间日期区域添加毛玻璃背景
     initDatetimeScrollEffect();
@@ -4458,17 +4467,29 @@ async function initMonitor() {
 
     updateMonitorData();
     if (monitorInterval) clearInterval(monitorInterval);
-    monitorInterval = setInterval(updateMonitorData, 3000);
+    monitorInterval = setInterval(updateMonitorData, 5000);
 }
 
-function updateMonitorData() {
-    const cpu = Math.floor(Math.random() * 30) + 10;
-    const ram = Math.floor(Math.random() * 20) + 40;
-    const storage = 78;
+async function updateMonitorData() {
+    try {
+        const info = await dataManager.apiRequest('/api/system', { quiet: true });
+        if (!info) return;
 
-    updateGauge('cpu-gauge', cpu);
-    updateGauge('ram-gauge', ram);
-    updateGauge('storage-gauge', storage);
+        updateGauge('cpu-gauge', info.cpu);
+        updateGauge('ram-gauge', info.ram ? info.ram.percent : 0);
+
+        if (info.storage) {
+            updateGauge('storage-gauge', info.storage.percent);
+        } else {
+            // 运行环境不支持磁盘统计时显示 N/A，不显示假数据
+            const storageEl = document.getElementById('storage-gauge');
+            const textEl = storageEl && storageEl.querySelector('.progress-text');
+            if (textEl) textEl.innerText = 'N/A';
+        }
+    } catch (error) {
+        // 请求失败时保留上一次的数值，仅记录警告
+        console.warn('[Monitor] 获取系统信息失败:', error.message);
+    }
 }
 
 function updateGauge(id, value) {

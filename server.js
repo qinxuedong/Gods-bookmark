@@ -1,10 +1,12 @@
 const express = require('express');
+const compression = require('compression');
 const bodyParser = require('body-parser');
 const cookieParser = require('cookie-parser');
 const path = require('path');
 const https = require('https');
 const http = require('http');
 const fs = require('fs');
+const os = require('os');
 const bcrypt = require('bcryptjs');
 const cron = require('node-cron');
 const db = require('./database');
@@ -17,6 +19,12 @@ const faviconInflightRequests = new Map();
 const FAVICON_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const FAVICON_FETCH_TIMEOUT_MS = 1500;
 const FAVICON_MAX_PAGE_ICON_CANDIDATES = 4;
+const FAVICON_CACHE_MAX_ENTRIES = 500;
+// favicon 落盘目录与索引：服务重启后无需重新抓取
+const FAVICON_DISK_DIR = path.join(__dirname, 'data', 'favicons');
+const FAVICON_INDEX_PATH = path.join(FAVICON_DISK_DIR, 'index.json');
+const faviconDiskIndex = new Map();
+let faviconIndexWriteScheduled = false;
 const DEFAULT_FAVICON_SVG = Buffer.from(
     `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
         <rect width="32" height="32" rx="8" fill="#1f2937"/>
@@ -25,6 +33,8 @@ const DEFAULT_FAVICON_SVG = Buffer.from(
 );
 
 // Middleware
+// gzip/br 压缩（SSE 端点已带 no-transform，不受影响）
+app.use(compression());
 // 增加 JSON 请求体大小限制（处理大量书签数据）
 app.use(bodyParser.json({ limit: '50mb' })); // 默认 100kb，增加到 50mb
 app.use(bodyParser.urlencoded({ limit: '50mb', extended: true }));
@@ -251,15 +261,11 @@ async function getUserIdFromSession(req) {
 // 多用户认证中间件 - 基于 sessions 表
 async function requireAuth(req, res, next) {
     const sessionId = req.cookies['session_id'];
-    
-    console.log('[REQUIRE AUTH] Checking authentication for:', req.path);
-    console.log('[REQUIRE AUTH] Session ID:', sessionId || 'none');
-    
+
     if (!sessionId) {
-        console.log('[REQUIRE AUTH] No session_id cookie found');
         return res.status(401).json({ error: 'Unauthorized' });
     }
-    
+
     try {
         // 从 sessions 表 JOIN users 表验证 session，并检查过期时间
         const session = await db.get(`
@@ -274,9 +280,8 @@ async function requireAuth(req, res, next) {
             INNER JOIN users u ON s.user_id = u.id
             WHERE s.id = ? AND s.expires_at > datetime('now')
         `, [sessionId]);
-        
+
         if (session) {
-            console.log('[REQUIRE AUTH] Session validated for user:', session.username);
             req.userId = session.user_id;
             req.user = {
                 id: session.user_id,
@@ -285,7 +290,6 @@ async function requireAuth(req, res, next) {
             };
             return next();
         } else {
-            console.log('[REQUIRE AUTH] Session not found or expired');
             return res.status(401).json({ error: 'Unauthorized' });
         }
     } catch (err) {
@@ -426,18 +430,95 @@ function setCachedFavicon(targetUrl, result) {
         expiresAt: Date.now() + FAVICON_CACHE_TTL_MS
     });
 
-    if (faviconCache.size <= 500) {
-        return;
-    }
-
-    for (const [cacheKey, cacheValue] of faviconCache.entries()) {
-        if (cacheValue.expiresAt <= Date.now()) {
-            faviconCache.delete(cacheKey);
-        }
-        if (faviconCache.size <= 400) {
+    // Map 保持插入顺序，超限时从最旧条目开始淘汰（近似 LRU）
+    while (faviconCache.size > FAVICON_CACHE_MAX_ENTRIES) {
+        const oldestKey = faviconCache.keys().next().value;
+        if (oldestKey === undefined) {
             break;
         }
+        faviconCache.delete(oldestKey);
     }
+}
+
+function initFaviconDiskCache() {
+    fs.mkdirSync(FAVICON_DISK_DIR, { recursive: true });
+    try {
+        const rawIndex = JSON.parse(fs.readFileSync(FAVICON_INDEX_PATH, 'utf8'));
+        for (const [url, entry] of Object.entries(rawIndex)) {
+            if (entry && typeof entry.file === 'string' && entry.savedAt > 0) {
+                faviconDiskIndex.set(url, entry);
+            }
+        }
+    } catch (error) {
+        // 首次运行或索引损坏，从空索引开始
+    }
+}
+
+function scheduleFaviconIndexWrite() {
+    if (faviconIndexWriteScheduled) {
+        return;
+    }
+    faviconIndexWriteScheduled = true;
+    setTimeout(() => {
+        faviconIndexWriteScheduled = false;
+        fs.writeFile(FAVICON_INDEX_PATH, JSON.stringify(Object.fromEntries(faviconDiskIndex)), (error) => {
+            if (error) {
+                console.warn('[FAVICON] 索引写入失败:', error.message);
+            }
+        });
+    }, 1000);
+}
+
+function persistFaviconToDisk(targetUrl, result) {
+    try {
+        if (!result || !Buffer.isBuffer(result.body) || result.body.length === 0) {
+            return;
+        }
+
+        let entry = faviconDiskIndex.get(targetUrl);
+        if (!entry) {
+            entry = {
+                file: `${crypto.createHash('sha1').update(targetUrl).digest('hex')}.bin`,
+                contentType: 'image/x-icon',
+                savedAt: 0
+            };
+            faviconDiskIndex.set(targetUrl, entry);
+        }
+
+        entry.contentType = result.contentType || 'image/x-icon';
+        const savedAt = Date.now();
+        entry.savedAt = savedAt;
+
+        fs.writeFile(path.join(FAVICON_DISK_DIR, entry.file), result.body, (error) => {
+            if (error) {
+                console.warn('[FAVICON] 图标写入磁盘失败:', targetUrl, error.message);
+                faviconDiskIndex.delete(targetUrl);
+                return;
+            }
+            scheduleFaviconIndexWrite();
+        });
+    } catch (error) {
+        console.warn('[FAVICON] 图标落盘异常:', targetUrl, error.message);
+    }
+}
+
+function readFaviconFromDisk(targetUrl) {
+    return new Promise((resolve) => {
+        const entry = faviconDiskIndex.get(targetUrl);
+        // 磁盘条目同样遵循 24 小时 TTL，过期后重新抓取
+        if (!entry || entry.savedAt + FAVICON_CACHE_TTL_MS <= Date.now()) {
+            resolve(null);
+            return;
+        }
+
+        fs.readFile(path.join(FAVICON_DISK_DIR, entry.file), (error, body) => {
+            if (error || !body || body.length === 0) {
+                resolve(null);
+                return;
+            }
+            resolve({ body, contentType: entry.contentType });
+        });
+    });
 }
 
 function getDefaultFaviconPayload() {
@@ -682,7 +763,6 @@ app.post('/api/users/login', async (req, res) => {
         
         if (!isValid) {
             console.log('[USER LOGIN] Invalid password for user:', username);
-            console.log('[USER LOGIN] Password hash in DB:', user.password_hash.substring(0, 20) + '...');
             return res.status(401).json({ error: 'Invalid credentials' });
         }
         
@@ -1001,6 +1081,70 @@ app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
 });
 
 // 2. Bookmarks (支持多用户数据隔离)
+// ===== 系统监控（真实数据） =====
+// 后台每 2 秒采样一次 CPU 占用，避免每个请求都做延迟采样
+let lastCpuTimes = os.cpus().map(cpu => cpu.times);
+let lastCpuUsagePercent = 0;
+
+setInterval(() => {
+    const currentCpuTimes = os.cpus().map(cpu => cpu.times);
+    let idleDelta = 0;
+    let totalDelta = 0;
+
+    currentCpuTimes.forEach((times, index) => {
+        const previous = lastCpuTimes[index] || times;
+        const idle = times.idle - previous.idle;
+        const total = (times.user - previous.user) +
+            (times.nice - previous.nice) +
+            (times.sys - previous.sys) +
+            (times.irq - previous.irq) +
+            idle;
+        idleDelta += idle;
+        totalDelta += total;
+    });
+
+    if (totalDelta > 0) {
+        lastCpuUsagePercent = Math.max(0, Math.min(100, Math.round((1 - idleDelta / totalDelta) * 100)));
+    }
+    lastCpuTimes = currentCpuTimes;
+}, 2000);
+
+function getStorageUsage() {
+    try {
+        const stats = fs.statfsSync(path.join(__dirname, 'data'));
+        const totalBytes = stats.blocks * stats.bsize;
+        const freeBytes = stats.bfree * stats.bsize;
+        if (totalBytes <= 0) {
+            return null;
+        }
+        const usedBytes = totalBytes - freeBytes;
+        return {
+            percent: Math.max(0, Math.min(100, Math.round((usedBytes / totalBytes) * 100))),
+            totalGB: Math.round((totalBytes / 1024 ** 3) * 10) / 10,
+            usedGB: Math.round((usedBytes / 1024 ** 3) * 10) / 10
+        };
+    } catch (error) {
+        // 运行环境不支持 statfs 时返回 null，前端显示 N/A
+        return null;
+    }
+}
+
+app.get('/api/system', requireAuth, (req, res) => {
+    const totalMem = os.totalmem();
+    const freeMem = os.freemem();
+    const usedMem = totalMem - freeMem;
+
+    res.json({
+        cpu: lastCpuUsagePercent,
+        ram: {
+            percent: totalMem > 0 ? Math.round((usedMem / totalMem) * 100) : 0,
+            usedMB: Math.round(usedMem / 1024 ** 2),
+            totalMB: Math.round(totalMem / 1024 ** 2)
+        },
+        storage: getStorageUsage()
+    });
+});
+
 app.get('/api/favicon', async (req, res) => {
     const rawUrl = typeof req.query.url === 'string' ? req.query.url.trim() : '';
 
@@ -1013,9 +1157,17 @@ app.get('/api/favicon', async (req, res) => {
         return sendFaviconResponse(res, cached);
     }
 
+    // 内存未命中时尝试磁盘缓存（服务重启后生效）
+    const diskResult = await readFaviconFromDisk(rawUrl);
+    if (diskResult) {
+        setCachedFavicon(rawUrl, diskResult);
+        return sendFaviconResponse(res, diskResult);
+    }
+
     try {
         const result = await getOrFetchFaviconPayload(rawUrl);
         setCachedFavicon(rawUrl, result);
+        persistFaviconToDisk(rawUrl, result);
         return sendFaviconResponse(res, result);
     } catch (error) {
         console.error('[FAVICON] Unhandled favicon fetch error:', rawUrl, error);
@@ -2728,16 +2880,19 @@ function matchesCronField(expr, value, min, max) {
 // 启动备份调度器
 initBackupScheduler();
 
+// 初始化 favicon 磁盘缓存（索引加载 + 目录创建）
+initFaviconDiskCache();
+
 // 静态文件服务（必须在所有API路由之后，避免拦截API请求）
-// 设置CSP头（不允许eval和unsafe-inline脚本，但允许内联样式）
+// 设置CSP头（不允许eval和unsafe-inline脚本，但允许内联样式；字体已改为系统字体栈，不再依赖外部源）
 app.use((req, res, next) => {
     // 只对HTML文件设置CSP
     if (req.path.endsWith('.html') || req.path === '/' || req.path === '') {
-        res.setHeader('Content-Security-Policy', 
+        res.setHeader('Content-Security-Policy',
             "default-src 'self'; " +
-            "script-src 'self' https://fonts.googleapis.com; " +  // 允许Google Fonts的脚本
-            "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.gstatic.com; " +
-            "font-src 'self' https://fonts.gstatic.com data:; " +
+            "script-src 'self'; " +
+            "style-src 'self' 'unsafe-inline'; " +
+            "font-src 'self' data:; " +
             "img-src 'self' data: https: http:; " +
             "connect-src 'self'; " +
             "frame-ancestors 'none'; " +
@@ -2748,7 +2903,38 @@ app.use((req, res, next) => {
     next();
 });
 
-app.use(express.static(path.join(__dirname, '/')));
+// 静态资源白名单：不再暴露整个项目根目录（data/、node_modules/、server.js 等包含敏感文件）
+// HTML 不缓存（保证部署后立即生效），JS/CSS 缓存 1 小时并保留 ETag 协商
+const sendHtmlFile = (fileName) => (req, res) => {
+    res.setHeader('Cache-Control', 'no-cache');
+    res.sendFile(path.join(__dirname, fileName));
+};
+
+app.get('/', sendHtmlFile('index.html'));
+app.get('/index.html', sendHtmlFile('index.html'));
+app.get('/login.html', sendHtmlFile('login.html'));
+
+// 浏览器默认请求的 favicon
+app.get('/favicon.ico', (req, res) => {
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.sendFile(path.join(__dirname, 'extension', 'icon16.png'));
+});
+
+// 页面实际引用的根目录图片与文档
+app.get('/Contro256.png', (req, res) => {
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.sendFile(path.join(__dirname, 'Contro256.png'));
+});
+app.get('/extension/icon16.png', (req, res) => {
+    res.setHeader('Cache-Control', 'public, max-age=86400');
+    res.sendFile(path.join(__dirname, 'extension', 'icon16.png'));
+});
+app.get('/BACKUP_CRON_GUIDE.md', sendHtmlFile('BACKUP_CRON_GUIDE.md'));
+
+// 前端脚本与样式目录
+app.use('/js', express.static(path.join(__dirname, 'js'), { maxAge: 3600000 }));
+app.use('/css', express.static(path.join(__dirname, 'css'), { maxAge: 3600000 }));
+app.use('/assets', express.static(path.join(__dirname, 'assets'), { maxAge: 3600000 }));
 
 // 404 处理（捕获所有未匹配的路由）
 app.use((req, res) => {

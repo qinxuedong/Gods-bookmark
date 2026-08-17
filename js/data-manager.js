@@ -6,14 +6,23 @@ class DataManager {
         this.API_BASE = ''; // 使用相对路径，与服务器同域
         this.authChecked = false;
         this.authStatus = false;
+        // 会话级配置缓存：一次页面加载内 /api/config 只请求一次，保存后同步更新
+        this.configCache = null;
+        // 书签短缓存：合并初始化阶段的重复全量拉取（渲染 + 搜索索引共用一份），保存或收到实时变更时失效
+        this.bookmarksCache = null;
+        this.bookmarksCacheExpiresAt = 0;
+        this.bookmarksInflight = null;
+        this.BOOKMARKS_CACHE_TTL_MS = 5000;
     }
 
     // 辅助方法：发送 API 请求
     async apiRequest(endpoint, options = {}) {
         try {
             const url = `${this.API_BASE}${endpoint}`;
-            console.log(`[API Request] ${options.method || 'GET'} ${url}`);
-            
+            if (!options.quiet) {
+                console.log(`[API Request] ${options.method || 'GET'} ${url}`);
+            }
+
             const response = await fetch(url, {
                 credentials: 'include', // 重要：包含 cookies
                 headers: {
@@ -23,7 +32,9 @@ class DataManager {
                 ...options
             });
 
-            console.log(`[API Response] ${response.status} ${response.statusText}`);
+            if (!options.quiet) {
+                console.log(`[API Response] ${response.status} ${response.statusText}`);
+            }
 
             if (!response.ok) {
                 let errorData;
@@ -43,12 +54,12 @@ class DataManager {
                 name: error.name,
                 stack: error.stack
             });
-            
+
             // 如果是因为网络错误（服务器未运行或CORS问题）
             if (error.message.includes('Failed to fetch') || error.name === 'TypeError') {
                 throw new Error('无法连接到服务器。请检查：1) 服务器是否正在运行  2) 端口是否正确（默认3000）  3) 浏览器控制台是否有CORS错误');
             }
-            
+
             throw error;
         }
     }
@@ -124,15 +135,43 @@ class DataManager {
     // --- Bookmarks ---
     async getBookmarks() {
         try {
-            console.log('[DataManager] Fetching bookmarks from /api/bookmarks...');
-            const data = await this.apiRequest('/api/bookmarks');
-            console.log('[DataManager] Bookmarks fetched successfully:', data?.length || 0, 'categories');
-            return data || [];
+            if (this.bookmarksCache && Date.now() < this.bookmarksCacheExpiresAt) {
+                return this.bookmarksCache;
+            }
+
+            // 并发去重：初始化阶段多个模块同时取书签时只发一次请求
+            if (this.bookmarksInflight) {
+                return this.bookmarksInflight;
+            }
+
+            this.bookmarksInflight = this.apiRequest('/api/bookmarks')
+                .then((data) => {
+                    const result = Array.isArray(data) ? data : [];
+                    this.bookmarksCache = result;
+                    this.bookmarksCacheExpiresAt = Date.now() + this.BOOKMARKS_CACHE_TTL_MS;
+                    console.log('[DataManager] Bookmarks fetched successfully:', result.length, 'categories');
+                    return result;
+                })
+                .catch((error) => {
+                    console.error('[DataManager] Get bookmarks error:', error);
+                    console.log('[DataManager] Falling back to default bookmarks');
+                    return this.getDefaultBookmarks(); // 返回默认数据作为降级
+                })
+                .finally(() => {
+                    this.bookmarksInflight = null;
+                });
+
+            return this.bookmarksInflight;
         } catch (error) {
-            console.error('[DataManager] Get bookmarks error:', error);
-            console.log('[DataManager] Falling back to default bookmarks');
-            return this.getDefaultBookmarks(); // 返回默认数据作为降级
+            console.error('[DataManager] Get bookmarks outer error:', error);
+            return this.getDefaultBookmarks();
         }
+    }
+
+    // 书签缓存失效（保存书签或收到远端实时变更时调用）
+    invalidateBookmarks() {
+        this.bookmarksCache = null;
+        this.bookmarksCacheExpiresAt = 0;
     }
 
     async saveBookmarks(data) {
@@ -141,6 +180,7 @@ class DataManager {
                 method: 'POST',
                 body: JSON.stringify(data)
             });
+            this.invalidateBookmarks();
             return true;
         } catch (error) {
             console.error('Save bookmarks error:', error);
@@ -154,9 +194,14 @@ class DataManager {
 
     // --- Dashboard ---
     async getDashboardConfig() {
+        if (this.configCache) {
+            return this.configCache;
+        }
+
         try {
             const data = await this.apiRequest('/api/config');
-            return data || this.getDefaultDashboardConfig();
+            this.configCache = data || this.getDefaultDashboardConfig();
+            return this.configCache;
         } catch (error) {
             console.error('Get config error:', error);
             return this.getDefaultDashboardConfig();
@@ -169,9 +214,11 @@ class DataManager {
                 method: 'POST',
                 body: JSON.stringify(config)
             });
+            this.configCache = config;
             return true;
         } catch (error) {
             console.error('Save config error:', error);
+            this.configCache = null;
             throw error;
         }
     }
