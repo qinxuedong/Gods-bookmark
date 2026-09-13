@@ -17,11 +17,15 @@ jobs:
       - name: Checkout source
         uses: actions/checkout@v4
 
+      # GHCR 镜像名必须全小写（仓库名可能含大写字母）
+      - name: Compute lowercase image name
+        run: echo "IMAGE_NAME_LC=${GITHUB_REPOSITORY,,}" >> $GITHUB_ENV
+
       - name: Login ghcr.io
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
 
       - name: Build gods-bookmark image
-        run: docker build -t ghcr.io/${{ github.repository }}:latest .
+        run: docker build -t ghcr.io/${IMAGE_NAME_LC}:latest .
 
       - name: Push gods-bookmark image
-        run: docker push ghcr.io/${{ github.repository }}:latest
+        run: docker push ghcr.io/${IMAGE_NAME_LC}:latest
