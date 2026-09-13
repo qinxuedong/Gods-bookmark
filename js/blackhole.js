@@ -315,22 +315,48 @@
         // 不再绘制眼睛和亮点效果
     }
 
-    function animate() {
-        updateEyePosition();
-        updateParticles();
-        updateLines();
-        draw();
-        animationId = requestAnimationFrame(animate);
+    function startAnimation() {
+        if (animationId || document.hidden || (window.matchMedia && window.matchMedia('(prefers-reduced-motion: reduce)').matches)) {
+            return;
+        }
+        animate();
     }
 
-    // DOM 加载完成后初始化
+    function stopAnimation() {
+        if (animationId) {
+            cancelAnimationFrame(animationId);
+            animationId = null;
+        }
+    }
+
+    document.addEventListener('visibilitychange', () => {
+        if (document.hidden) {
+            stopAnimation();
+        } else {
+            startAnimation();
+        }
+    });
+
+    function scheduleInit() {
+        const run = () => {
+            init();
+            if (window.requestIdleCallback) {
+                window.requestIdleCallback(startAnimation, { timeout: 1000 });
+            } else {
+                setTimeout(startAnimation, 0);
+            }
+        };
+        if (window.requestIdleCallback) {
+            window.requestIdleCallback(run, { timeout: 1200 });
+        } else {
+            setTimeout(run, 200);
+        }
+    }
+
+    // DOM 加载完成后初始化；将粒子创建和动画让给空闲时段
     if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', () => {
-            // 延迟初始化，确保时间区域已渲染
-            setTimeout(init, 200);
-        });
+        document.addEventListener('DOMContentLoaded', scheduleInit);
     } else {
-        // 延迟初始化，确保时间区域已渲染
-        setTimeout(init, 200);
+        scheduleInit();
     }
 })();

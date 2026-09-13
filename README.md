@@ -8,7 +8,7 @@
 
 ## 当前版本
 
-- Web 应用：`2.0.2`
+- Web 应用：`2.0.3`
 - 浏览器扩展：`2.0.1`
 
 ## 核心能力
@@ -109,6 +109,7 @@ npm run build-extension
 - [DOCKER_DEPLOYMENT.md](DOCKER_DEPLOYMENT.md)
 - [BACKUP_CRON_GUIDE.md](BACKUP_CRON_GUIDE.md)
 - [EXTENSION_CHECK_REPORT.md](EXTENSION_CHECK_REPORT.md)
+- [RELEASE_NOTES_v2.0.3.md](RELEASE_NOTES_v2.0.3.md)
 - [RELEASE_NOTES_v2.0.1.md](RELEASE_NOTES_v2.0.1.md)
 - [RELEASE_NOTES_v2.0.0.md](RELEASE_NOTES_v2.0.0.md)
 - [RELEASE_NOTES_v1.1.2.md](RELEASE_NOTES_v1.1.2.md)

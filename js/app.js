@@ -110,13 +110,18 @@ document.addEventListener('DOMContentLoaded', async () => {
     // Check if on login page, if so skip
     if (window.location.pathname.includes('login.html')) return;
 
-    await initGlobalUI();
-
     const path = window.location.pathname;
-    // Handle both root path and index.html
+    // 先启动仪表盘数据加载；认证和标题菜单在后台更新，不阻塞首屏内容
     if (path.endsWith('index.html') || path === '/' || path.endsWith('/')) {
-        initDashboard();
+        initDashboard().catch(error => {
+            console.error('[initDashboard] Startup failed:', error);
+        });
     }
+
+    // UI 权限、标题和控制中心菜单后台初始化
+    initGlobalUI().catch(error => {
+        console.error('[initGlobalUI] Startup failed:', error);
+    });
 });
 
 // 绑定HTML中的内联事件处理器（符合CSP）
@@ -1174,43 +1179,43 @@ function setupBookmarksRealtimeSync() {
 
 /* --- Dashboard Logic --- */
 async function initDashboard() {
-    // 恢复主题设置（优先执行；配置已在 initGlobalUI 预取，此处命中缓存不再发请求）
+    // 恢复主题设置（优先执行；配置已缓存，此处不再发请求）
     if (typeof window.restoreTheme === 'function') {
         await window.restoreTheme();
     }
 
-    // 并行加载互不依赖的模块：书签渲染、监控部件、常用标签栏
+    // 并行加载互不依赖的模块：书签渲染、常用标签栏
     const bookmarksReady = loadBookmarks();
-    const monitorReady = initMonitor();
     const frequentReady = loadFrequentBookmarks();
+    // 监控部件内部自检：页面无仪表元素或未登录时自动跳过
+    initMonitor().catch(error => console.warn('[Monitor] 初始化失败:', error.message));
 
     await bookmarksReady;
 
-    // 初始化全局搜索（依赖书签数据，此时复用书签缓存，不再重复全量拉取）
-    await initGlobalSearch();
-
-    // 检查用户认证状态（多用户模式，认证结果已缓存，无额外请求）
-    if (window.userManager) {
-        try {
-            const authResult = await window.userManager.checkAuth();
-            console.log('[initDashboard] User auth check result:', authResult);
-            if (authResult && authResult.isLoggedIn && authResult.user) {
-                console.log('[initDashboard] Current user:', authResult.user);
-            }
-        } catch (error) {
-            console.error('[initDashboard] Error checking user auth:', error);
-        }
-    }
-
-    // 加载便签待办
+    // 搜索/待办/实时同步依赖登录态与私有数据，未登录时界面已隐藏，跳过初始化
     const isLoggedIn = await dataManager.isLoggedIn();
+
     if (isLoggedIn) {
+        await initGlobalSearch();
+
+        if (window.userManager) {
+            try {
+                const authResult = await window.userManager.checkAuth();
+                console.log('[initDashboard] User auth check result:', authResult);
+                if (authResult && authResult.isLoggedIn && authResult.user) {
+                    console.log('[initDashboard] Current user:', authResult.user);
+                }
+            } catch (error) {
+                console.error('[initDashboard] Error checking user auth:', error);
+            }
+        }
+
         setupBookmarksRealtimeSync();
         await initTodos();
     }
 
     // 等待并行模块完成
-    await Promise.all([monitorReady, frequentReady]);
+    await Promise.all([frequentReady]);
 
     // 初始化滚动检测，为时间日期区域添加毛玻璃背景
     initDatetimeScrollEffect();
@@ -2497,18 +2502,19 @@ function bindFaviconErrorHandlers(container) {
 // 加载常用标签栏（Top10）
 async function loadFrequentBookmarks() {
     try {
-        const topBookmarks = await dataManager.getTopBookmarks(10);
         const container = document.getElementById('frequent-bookmarks-list');
         const section = document.getElementById('frequent-bookmarks-bar');
 
         if (!container || !section) return;
 
-        // 检查登录状态，未登录时不显示
+        // 先检查登录状态，未登录时不显示也不请求
         const isLoggedIn = await dataManager.isLoggedIn();
         if (!isLoggedIn) {
             section.style.display = 'none';
             return;
         }
+
+        const topBookmarks = await dataManager.getTopBookmarks(10);
 
         // 常驻显示，即使没有数据也显示
         section.style.display = 'block';
@@ -2680,7 +2686,7 @@ function buildBookmarkFaviconImg(url, fallbackIcon = '🔗') {
         return fallbackIcon;
     }
 
-    return `<img src="${escapeHtml(faviconUrl)}" width="16" height="16" style="vertical-align: middle;">`;
+    return `<img src="${escapeHtml(faviconUrl)}" width="16" height="16" loading="lazy" decoding="async" style="vertical-align: middle;">`;
 }
 
 function getBookmarkPlainIcon(iconValue, fallbackIcon = '🔗') {
@@ -3588,9 +3594,23 @@ async function loadBookmarks() {
         return;
     }
 
+    let isAdmin = false;
+
     try {
         let bookmarksData = null;
-        let isAdmin = false;
+
+        // 认证优先于私有数据渲染，避免未登录时短暂显示本地默认书签
+        try {
+            isAdmin = await dataManager.isLoggedIn();
+        } catch (error) {
+            console.error('Failed to check login status:', error);
+            isAdmin = false;
+        }
+
+        if (!isAdmin) {
+            container.innerHTML = '';
+            return;
+        }
 
         try {
             console.log('[loadBookmarks] Fetching bookmarks from API...');
@@ -3615,14 +3635,6 @@ async function loadBookmarks() {
                 container.innerHTML = '<p style="color: var(--text-secondary); padding: 2rem; text-align: center;">⚠️ 无法加载书签：请确保服务器正在运行</p>';
                 return;
             }
-        }
-
-        try {
-            isAdmin = await dataManager.isLoggedIn();
-        } catch (error) {
-            console.error('Failed to check login status:', error);
-            // 默认未登录状态
-            isAdmin = false;
         }
 
         const isSettingsMode = document.getElementById('admin-sidebar')?.classList.contains('open');
@@ -3695,7 +3707,7 @@ async function loadBookmarks() {
                     if (logoUrl) {
                         // 如果有有效的logo，使用img标签，emoji作为fallback（不使用内联事件处理器）
                         const fallbackIcon = item.icon && !item.icon.includes('<img') ? item.icon : '🔗';
-                        iconDisplay = `<img src="${logoUrl}" width="16" height="16" style="vertical-align: middle;">`;
+                        iconDisplay = `<img src="${escapeHtml(logoUrl)}" width="16" height="16" loading="lazy" decoding="async" style="vertical-align: middle;">`;
                     } else if (item.icon && item.icon.includes('<img')) {
                         // 如果icon已经是img标签，移除内联事件处理器；若仍包含 gstatic/faviconV2，则直接使用默认图标
                         let cleanedIcon = item.icon
@@ -3882,11 +3894,14 @@ async function loadBookmarks() {
         console.error('loadBookmarks error:', error);
         container.innerHTML = '<p style="color: var(--text-secondary); padding: 2rem; text-align: center;">⚠️ 加载书签时发生错误：' + (error.message || '未知错误') + '</p>';
     } finally {
-        // 加载书签后刷新搜索缓存
-        if (typeof refreshBookmarksCache === 'function') {
-            await refreshBookmarksCache();
+        // 未登录时不请求书签/统计相关接口，避免 401 噪音
+        if (isAdmin) {
+            // 加载书签后刷新搜索缓存
+            if (typeof refreshBookmarksCache === 'function') {
+                await refreshBookmarksCache();
+            }
+            scheduleDuplicateBookmarkCheck();
         }
-        scheduleDuplicateBookmarkCheck();
     }
 }
 
@@ -4424,8 +4439,19 @@ window.toggleConfig = async function (key) {
 let monitorInterval;
 
 async function initMonitor() {
-    const config = await dataManager.getDashboardConfig();
+    // 当前页面未渲染任何监控仪表时直接跳过，避免每 5 秒的无意义轮询
+    if (!document.getElementById('cpu-gauge') &&
+        !document.getElementById('ram-gauge') &&
+        !document.getElementById('storage-gauge')) {
+        return;
+    }
+
     const isAdmin = await dataManager.isLoggedIn();
+    if (!isAdmin) {
+        return;
+    }
+
+    const config = await dataManager.getDashboardConfig();
 
     // Toggle visibility based on config
     const updateWidget = (id, show) => {
@@ -6070,8 +6096,8 @@ async function initGlobalSearch() {
     // 加载书签缓存
     await refreshBookmarksCache();
 
-    // 加载搜索配置
-    await loadSearchConfig();
+    // 首屏先完成可见内容，搜索配置与点击统计在后台刷新，不阻塞仪表盘展示
+    loadSearchConfig().catch(error => console.warn('[GlobalSearch] 后台加载配置失败:', error));
 
     // 监听来自扩展的消息（用于快捷键打开搜索浮窗）
     window.addEventListener('message', (event) => {

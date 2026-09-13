@@ -1,3 +1,6 @@
+# Local scan artifacts
+.mimosa/
+
 # Dependencies
 node_modules/
 package-lock.json

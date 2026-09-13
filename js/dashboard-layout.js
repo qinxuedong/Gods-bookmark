@@ -2498,11 +2498,20 @@ async function restoreBookmarkLayout(config) {
     }
 }
 
-// 初始化
+// 初始化（延迟到空闲时段：restoreLayout 仅处理监控卡片布局与模态框按钮绑定，
+// 不影响主题和书签布局恢复——书签布局由 loadBookmarks() 完成后单独恢复）
 document.addEventListener('DOMContentLoaded', () => {
-    restoreLayout();
-    // 确保用户资料模态框按钮在页面加载时被绑定
-    bindUserAndBackupEvents();
+    const runStartupTasks = () => {
+        restoreLayout();
+        // 确保用户资料模态框按钮在页面加载时被绑定
+        bindUserAndBackupEvents();
+    };
+
+    if (typeof window.requestIdleCallback === 'function') {
+        window.requestIdleCallback(runStartupTasks, { timeout: 1200 });
+    } else {
+        setTimeout(runStartupTasks, 0);
+    }
 });
 
 // ===== 布局编辑默认开启 (全局拖拽) =====

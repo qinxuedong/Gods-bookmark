@@ -275,6 +275,17 @@ body.articles-page main.container::after {
 }
 
 /* 书签卡片容器 - 在黑洞上方 */
+.bookmark-loading-state {
+    grid-column: 1 / -1;
+    min-height: 140px;
+    display: grid;
+    place-items: center;
+    color: var(--text-secondary);
+    border: 1px solid var(--card-border);
+    border-radius: 0.75rem;
+    background: rgba(30, 41, 59, 0.35);
+}
+
 #bookmarks-container {
     padding-top: var(--bookmark-layout-edge-gap);
     padding-left: var(--bookmark-layout-edge-gap);
@@ -285,6 +296,8 @@ body.articles-page main.container::after {
     border-top: 1px solid var(--card-border); /* 顶部横线分隔 */
     padding-top: calc(1.5rem + 5px); /* 横线上方的间距（下移5px） */
     margin-top: calc(-1.5rem - 5px); /* 抵消padding-top，保持整体位置上移 */
+    content-visibility: auto;
+    contain-intrinsic-size: 180px 320px;
 }
 
 /* 书签卡片 - 在黑洞上方 */

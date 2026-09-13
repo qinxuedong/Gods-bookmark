@@ -9,6 +9,7 @@ class UserManager {
         // 认证结果缓存：一次页面加载内 /api/users/check-auth 只请求一次，登录/登出后失效
         this.authChecked = false;
         this.authResult = null;
+        this.authInflight = null;
     }
 
     async login(username, password) {
@@ -55,7 +56,9 @@ class UserManager {
         if (this.authChecked) {
             return this.authResult;
         }
+        if (this.authInflight) return this.authInflight;
 
+        this.authInflight = (async () => {
         try {
             const response = await fetch(`${this.API_BASE}/api/users/check-auth`, {
                 credentials: 'include'
@@ -71,6 +74,8 @@ class UserManager {
             console.error('[UserManager] Check auth error:', error);
             return { isLoggedIn: false };
         }
+        })();
+        try { return await this.authInflight; } finally { this.authInflight = null; }
     }
 
     async createUser(username, password, role = 'user') {

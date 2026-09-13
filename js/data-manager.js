@@ -6,8 +6,8 @@ class DataManager {
         this.API_BASE = ''; // 使用相对路径，与服务器同域
         this.authChecked = false;
         this.authStatus = false;
-        // 会话级配置缓存：一次页面加载内 /api/config 只请求一次，保存后同步更新
         this.configCache = null;
+        this.configInflight = null;
         // 书签短缓存：合并初始化阶段的重复全量拉取（渲染 + 搜索索引共用一份），保存或收到实时变更时失效
         this.bookmarksCache = null;
         this.bookmarksCacheExpiresAt = 0;
@@ -119,6 +119,13 @@ class DataManager {
         }
 
         try {
+            // Reuse UserManager's in-flight auth request when available.
+            if (window.userManager && typeof window.userManager.checkAuth === 'function') {
+                const result = await window.userManager.checkAuth();
+                this.authStatus = result?.isLoggedIn === true;
+                this.authChecked = true;
+                return this.authStatus;
+            }
             // 使用新的认证端点
             const result = await this.apiRequest('/api/users/check-auth');
             this.authStatus = result.isLoggedIn || false;
@@ -197,7 +204,9 @@ class DataManager {
         if (this.configCache) {
             return this.configCache;
         }
+        if (this.configInflight) return this.configInflight;
 
+        this.configInflight = (async () => {
         try {
             const data = await this.apiRequest('/api/config');
             this.configCache = data || this.getDefaultDashboardConfig();
@@ -206,6 +215,8 @@ class DataManager {
             console.error('Get config error:', error);
             return this.getDefaultDashboardConfig();
         }
+        })();
+        try { return await this.configInflight; } finally { this.configInflight = null; }
     }
 
     async saveDashboardConfig(config) {

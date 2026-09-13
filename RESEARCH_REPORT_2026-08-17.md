@@ -148,3 +148,56 @@
 **遗留事项**：
 - 部署侧建议尽快启用 HTTPS 反代（HTTP/2 可顺带解决 SSE 长连接挤占 HTTP/1.1 并发的问题）
 - 浏览器强刷一次（Ctrl+F5）以使旧缓存的前端资源失效
+
+---
+
+## 七、第二轮首屏优化（2026-08-17 晚间追加）
+
+第二轮针对"外网首屏卡顿"继续按推荐顺序处理。**声明：本轮未进行浏览器端 Performance 实测，以下效果判断基于代码链路证据与请求计数，非真实计时数据。**
+
+### 7.1 已实施改动
+
+| # | 改动 | 文件 | 说明 |
+|---|---|---|---|
+| 1 | 首屏初始化与 UI 权限初始化解耦 | `js/app.js` | `DOMContentLoaded` 中 `initDashboard()` 与 `initGlobalUI()` 并行启动（原先串行等待），书签/主题/常用栏立即开始加载 |
+| 2 | loadBookmarks 认证门 | `js/app.js` | 未登录时不请求书签/统计接口、清空容器（保持私有数据不外泄）；`finally` 中的搜索缓存刷新与查重调度仅登录后执行 |
+| 3 | 登录门控非公开模块 | `js/app.js` | 未登录时跳过 `initGlobalSearch`、待办加载、SSE 连接、监控轮询——此前未登录也会产生 401 请求噪音 |
+| 4 | 监控轮询守卫 | `js/app.js` | **发现当前 HTML 中不存在 `#cpu-gauge` 等仪表元素**，`initMonitor` 的 5 秒 `/api/system` 轮询是纯开销；现无仪表元素或未登录时直接跳过 |
+| 5 | loadFrequentBookmarks 顺序调整 | `js/app.js` | 先查登录态再请求 Top10，未登录不发请求 |
+| 6 | 认证请求单飞 | `js/user-manager.js`、`js/data-manager.js` | `checkAuth` 并发去重；`isLoggedIn` 复用 `UserManager` 的在途请求，首屏认证请求最多 1 次 |
+| 7 | 配置请求单飞 | `js/data-manager.js` | `getDashboardConfig` 并发去重（缓存已存在，补充并发场景） |
+| 8 | favicon 懒加载 | `js/app.js` | 书签图标 `<img>` 增加 `loading="lazy"` + `decoding="async"`，视口外不发起请求 |
+| 9 | 搜索配置后台加载 | `js/app.js` | `initGlobalSearch` 不再阻塞等待搜索配置 |
+| 10 | 黑洞动画让路 | `js/blackhole.js` | 初始化与动画启动延迟到 `requestIdleCallback` 空闲时段；页面隐藏暂停；`prefers-reduced-motion` 用户不启动 |
+| 11 | 首屏骨架与渲染优化 | `index.html`、`css/style.css` | 书签容器初始显示"正在加载书签…"占位；容器加 `content-visibility: auto` 减少视口外布局开销 |
+| 12 | dashboard-layout 启动任务延后 | `js/dashboard-layout.js` | `restoreLayout`（仅监控卡片布局，当前页面无仪表实为空操作）与模态框按钮绑定延后到空闲时段执行 |
+
+### 7.2 自动化回归测试（新增）
+
+新增 `test/startup.test.mjs`（node:test + vm 沙箱 + mock fetch，不触网络/数据库/真实会话），`npm test` 运行：
+
+1. `getDashboardConfig`：并发去重、会话缓存、保存后同步更新（GET 恰 1 次）
+2. `getBookmarks`：并发去重共享同一结果、TTL 内不重拉、手动/保存后失效（GET 恰 3 次、POST 恰 1 次）
+3. 认证单飞：`checkAuth` 并发仅 1 次请求；`isLoggedIn` 复用 `UserManager`；登出后缓存失效
+4. `loadBookmarks` 认证门：未登录不发任何私有数据请求且容器清空
+5. `loadBookmarks` 登录渲染：书签恰好拉取 1 次、分类与书签名正确渲染
+6. 农历算法：11 个已知日期对照（含闰二月/闰六月/边界 1900-01-31）
+
+**结果：6/6 通过。** 测试中发现并修正了三处测试自身的桩缺陷（容器桩未记忆化、fetch 日志未区分方法、`escapeHtml` 依赖的 DOM 转义未模拟），产品代码未因此改动。
+
+### 7.3 服务器冒烟验证（第二轮后复测）
+
+- 首页含加载占位符；js/css 全部 200；app.js gzip 后 71.5KB
+- `/data/database.sqlite`、`/server.js`、`/package.json` 仍为 404
+- `/api/system`、`/api/bookmarks` 未登录 401；`/api/favicon` 正常返回图标
+
+### 7.4 刻意未做与理由
+
+- **dashboard-layout.js 文件级拆分**：该文件 224KB，启动执行已确认极轻（顶层仅状态声明与 window 导出，DOMContentLoaded 工作已延后），剩余成本是解析。但拆分涉及约 300 个 window 导出与跨文件引用，在无浏览器可视化验证条件下整体延迟或拆分风险（主题/布局/控制中心回归）大于收益（预计数十毫秒解析时间）。已列入后续建议，建议在浏览器 Performance 面板确认解析确为瓶颈后再实施。
+- **减少 backdrop-filter**：50 处使用散布在视觉样式中，盲改有视觉回归风险，未经浏览器验证不动。
+
+### 7.5 对第一轮结论的修正
+
+- 第一轮报告"首屏请求链收敛为 config / check-auth / bookmarks / top / todos 并行各一次"表述不完整：当时 check-auth 与 config 的**并发去重**尚未实现（仅缓存），第二轮补充后才严格成立；且 top/todos 依赖登录态判断，未登录时不再发出。
+- 第一轮加回的真实监控轮询（5 秒 `/api/system`）在当前 HTML 无仪表元素的前提下属于无意义开销，第二轮已修正——仪表 UI 缺失本身是一个独立的历史遗留问题（组件被移除但 JS 保留）。
+

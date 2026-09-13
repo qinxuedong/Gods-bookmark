@@ -84,6 +84,14 @@ function initTables() {
             value TEXT
         )`);
 
+        // Favicon disk cache (survives server restarts; filename-free, keyed by url hash)
+        db.run(`CREATE TABLE IF NOT EXISTS favicon_cache (
+            url_key TEXT PRIMARY KEY,
+            content_type TEXT,
+            body BLOB,
+            saved_at INTEGER
+        )`);
+
         // Create default admin user if users table is empty (使用同步方式，因为db.serialize已确保顺序执行)
         db.get("SELECT COUNT(*) as count FROM users", (err, row) => {
             if (err) {

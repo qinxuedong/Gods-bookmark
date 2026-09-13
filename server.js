@@ -20,11 +20,6 @@ const FAVICON_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 const FAVICON_FETCH_TIMEOUT_MS = 1500;
 const FAVICON_MAX_PAGE_ICON_CANDIDATES = 4;
 const FAVICON_CACHE_MAX_ENTRIES = 500;
-// favicon 落盘目录与索引：服务重启后无需重新抓取
-const FAVICON_DISK_DIR = path.join(__dirname, 'data', 'favicons');
-const FAVICON_INDEX_PATH = path.join(FAVICON_DISK_DIR, 'index.json');
-const faviconDiskIndex = new Map();
-let faviconIndexWriteScheduled = false;
 const DEFAULT_FAVICON_SVG = Buffer.from(
     `<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
         <rect width="32" height="32" rx="8" fill="#1f2937"/>
@@ -440,85 +435,45 @@ function setCachedFavicon(targetUrl, result) {
     }
 }
 
-function initFaviconDiskCache() {
-    fs.mkdirSync(FAVICON_DISK_DIR, { recursive: true });
+// favicon 持久缓存存放在 SQLite（favicon_cache 表，随 data 卷持久化，重启不失效）。
+// 键为 sha256(url)，不派生任何文件系统路径。
+function getFaviconCacheKey(targetUrl) {
+    return crypto.createHash('sha256').update(targetUrl).digest('hex');
+}
+
+async function readFaviconFromCache(targetUrl) {
     try {
-        const rawIndex = JSON.parse(fs.readFileSync(FAVICON_INDEX_PATH, 'utf8'));
-        for (const [url, entry] of Object.entries(rawIndex)) {
-            if (entry && typeof entry.file === 'string' && entry.savedAt > 0) {
-                faviconDiskIndex.set(url, entry);
-            }
+        const row = await db.get(
+            "SELECT content_type, body, saved_at FROM favicon_cache WHERE url_key = ?",
+            [getFaviconCacheKey(targetUrl)]
+        );
+        // 缓存条目遵循 24 小时 TTL，过期后重新抓取
+        if (!row || !row.body || !row.body.length || row.saved_at + FAVICON_CACHE_TTL_MS <= Date.now()) {
+            return null;
         }
+        return { body: row.body, contentType: row.content_type || 'image/x-icon' };
     } catch (error) {
-        // 首次运行或索引损坏，从空索引开始
+        console.warn('[FAVICON] 缓存读取失败:', error.message);
+        return null;
     }
 }
 
-function scheduleFaviconIndexWrite() {
-    if (faviconIndexWriteScheduled) {
-        return;
-    }
-    faviconIndexWriteScheduled = true;
-    setTimeout(() => {
-        faviconIndexWriteScheduled = false;
-        fs.writeFile(FAVICON_INDEX_PATH, JSON.stringify(Object.fromEntries(faviconDiskIndex)), (error) => {
-            if (error) {
-                console.warn('[FAVICON] 索引写入失败:', error.message);
-            }
-        });
-    }, 1000);
-}
-
-function persistFaviconToDisk(targetUrl, result) {
+async function persistFaviconToCache(targetUrl, result) {
     try {
         if (!result || !Buffer.isBuffer(result.body) || result.body.length === 0) {
             return;
         }
 
-        let entry = faviconDiskIndex.get(targetUrl);
-        if (!entry) {
-            entry = {
-                file: `${crypto.createHash('sha1').update(targetUrl).digest('hex')}.bin`,
-                contentType: 'image/x-icon',
-                savedAt: 0
-            };
-            faviconDiskIndex.set(targetUrl, entry);
-        }
+        await db.run(
+            "INSERT OR REPLACE INTO favicon_cache (url_key, content_type, body, saved_at) VALUES (?, ?, ?, ?)",
+            [getFaviconCacheKey(targetUrl), result.contentType || 'image/x-icon', result.body, Date.now()]
+        );
 
-        entry.contentType = result.contentType || 'image/x-icon';
-        const savedAt = Date.now();
-        entry.savedAt = savedAt;
-
-        fs.writeFile(path.join(FAVICON_DISK_DIR, entry.file), result.body, (error) => {
-            if (error) {
-                console.warn('[FAVICON] 图标写入磁盘失败:', targetUrl, error.message);
-                faviconDiskIndex.delete(targetUrl);
-                return;
-            }
-            scheduleFaviconIndexWrite();
-        });
+        // 清理过期条目，避免无限增长
+        await db.run("DELETE FROM favicon_cache WHERE saved_at <= ?", [Date.now() - FAVICON_CACHE_TTL_MS]);
     } catch (error) {
-        console.warn('[FAVICON] 图标落盘异常:', targetUrl, error.message);
+        console.warn('[FAVICON] 缓存写入失败:', targetUrl, error.message);
     }
-}
-
-function readFaviconFromDisk(targetUrl) {
-    return new Promise((resolve) => {
-        const entry = faviconDiskIndex.get(targetUrl);
-        // 磁盘条目同样遵循 24 小时 TTL，过期后重新抓取
-        if (!entry || entry.savedAt + FAVICON_CACHE_TTL_MS <= Date.now()) {
-            resolve(null);
-            return;
-        }
-
-        fs.readFile(path.join(FAVICON_DISK_DIR, entry.file), (error, body) => {
-            if (error || !body || body.length === 0) {
-                resolve(null);
-                return;
-            }
-            resolve({ body, contentType: entry.contentType });
-        });
-    });
 }
 
 function getDefaultFaviconPayload() {
@@ -563,16 +518,36 @@ function extractIconLinksFromHtml(html, baseUrl) {
     return iconUrls;
 }
 
+const FAVICON_MAX_REDIRECTS = 3;
+
 async function fetchWithTimeout(url, options = {}) {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), FAVICON_FETCH_TIMEOUT_MS);
 
     try {
-        return await fetch(url, {
-            redirect: 'follow',
-            signal: controller.signal,
-            ...options
-        });
+        // 手动跟随重定向：每一跳都重新校验目标，防止 30x 跳转到内网地址（SSRF）
+        let currentUrl = url;
+        for (let hop = 0; hop <= FAVICON_MAX_REDIRECTS; hop++) {
+            if (!isAllowedFaviconTarget(currentUrl)) {
+                throw new Error(`favicon target not allowed: ${currentUrl}`);
+            }
+
+            const response = await fetch(currentUrl, {
+                signal: controller.signal,
+                ...options,
+                redirect: 'manual'
+            });
+
+            const location = response.headers.get('location');
+            if (response.status >= 300 && response.status < 400 && location) {
+                try { response.body?.cancel(); } catch (error) { /* 释放连接失败可忽略 */ }
+                currentUrl = new URL(location, currentUrl).toString();
+                continue;
+            }
+
+            return response;
+        }
+        throw new Error(`too many favicon redirects: ${url}`);
     } finally {
         clearTimeout(timeoutId);
     }
@@ -1157,8 +1132,8 @@ app.get('/api/favicon', async (req, res) => {
         return sendFaviconResponse(res, cached);
     }
 
-    // 内存未命中时尝试磁盘缓存（服务重启后生效）
-    const diskResult = await readFaviconFromDisk(rawUrl);
+    // 内存未命中时尝试持久缓存（SQLite，服务重启后生效）
+    const diskResult = await readFaviconFromCache(rawUrl);
     if (diskResult) {
         setCachedFavicon(rawUrl, diskResult);
         return sendFaviconResponse(res, diskResult);
@@ -1167,7 +1142,7 @@ app.get('/api/favicon', async (req, res) => {
     try {
         const result = await getOrFetchFaviconPayload(rawUrl);
         setCachedFavicon(rawUrl, result);
-        persistFaviconToDisk(rawUrl, result);
+        persistFaviconToCache(rawUrl, result);
         return sendFaviconResponse(res, result);
     } catch (error) {
         console.error('[FAVICON] Unhandled favicon fetch error:', rawUrl, error);
@@ -2050,7 +2025,7 @@ app.get('/api/backup/configs', requireAuth, async (req, res) => {
 });
 
 // 创建备份配置
-app.post('/api/backup/configs', requireAuth, async (req, res) => {
+app.post('/api/backup/configs', requireAuth, requireAdmin, async (req, res) => {
     try {
         const { backupType, config, enabled = true, schedule } = req.body;
         
@@ -2063,51 +2038,9 @@ app.post('/api/backup/configs', requireAuth, async (req, res) => {
             return res.status(403).json({ error: 'Only admin can create local/NAS backup' });
         }
         
-        // 验证本地备份路径
-        if (backupType === 'local' && config.path) {
-            const backupPath = config.path.trim();
-            if (!backupPath) {
-                return res.status(400).json({ error: '备份路径不能为空' });
-            }
-            
-            // 尝试解析路径
-            const resolvedPath = path.isAbsolute(backupPath) 
-                ? backupPath 
-                : path.resolve(__dirname, backupPath);
-            
-            console.log('[CREATE BACKUP CONFIG] 备份路径:', resolvedPath);
-            
-            // 检查路径是否可访问（如果目录已存在）
-            if (fs.existsSync(resolvedPath)) {
-                try {
-                    fs.accessSync(resolvedPath, fs.constants.W_OK);
-                } catch (accessErr) {
-                    console.error('[CREATE BACKUP CONFIG] 路径不可写:', accessErr.message);
-                    return res.status(400).json({ 
-                        error: `备份路径不可写: ${resolvedPath}。请检查目录权限。错误: ${accessErr.message}` 
-                    });
-                }
-            } else {
-                // 如果目录不存在，尝试创建（仅验证，不实际创建）
-                try {
-                    // 检查父目录是否存在且可写
-                    const parentDir = path.dirname(resolvedPath);
-                    if (fs.existsSync(parentDir)) {
-                        fs.accessSync(parentDir, fs.constants.W_OK);
-                    } else {
-                        return res.status(400).json({ 
-                            error: `备份路径的父目录不存在: ${parentDir}。请先创建目录。` 
-                        });
-                    }
-                } catch (parentErr) {
-                    console.error('[CREATE BACKUP CONFIG] 父目录检查失败:', parentErr.message);
-                    return res.status(400).json({ 
-                        error: `无法访问备份路径的父目录。请检查目录权限。错误: ${parentErr.message}` 
-                    });
-                }
-            }
-        }
-        
+        // 备份写入位置固定为服务端配置的 BACKUP_ROOT_DIR（默认 <项目>/backups），
+        // 配置中的 path 字段不再参与文件系统写入，避免任意路径写入（详见 README 安全说明）
+
         const result = await db.run(
             "INSERT INTO backup_configs (user_id, backup_type, config, enabled, schedule) VALUES (?, ?, ?, ?, ?)",
             [req.userId || 0, backupType, JSON.stringify(config), enabled ? 1 : 0, schedule || null]
@@ -2121,7 +2054,7 @@ app.post('/api/backup/configs', requireAuth, async (req, res) => {
 });
 
 // 更新备份配置
-app.put('/api/backup/configs/:id', requireAuth, async (req, res) => {
+app.put('/api/backup/configs/:id', requireAuth, requireAdmin, async (req, res) => {
     try {
         const configId = req.params.id;
         const { backupType, config, enabled, schedule } = req.body;
@@ -2180,7 +2113,7 @@ app.put('/api/backup/configs/:id', requireAuth, async (req, res) => {
 });
 
 // 删除备份配置
-app.delete('/api/backup/configs/:id', requireAuth, async (req, res) => {
+app.delete('/api/backup/configs/:id', requireAuth, requireAdmin, async (req, res) => {
     try {
         const configId = req.params.id;
         
@@ -2270,7 +2203,7 @@ app.post('/api/backup/import', requireAuth, async (req, res) => {
 });
 
 // 执行手动备份
-app.post('/api/backup/run/:id', requireAuth, async (req, res) => {
+app.post('/api/backup/run/:id', requireAuth, requireAdmin, async (req, res) => {
     try {
         const configId = req.params.id;
         
@@ -2321,7 +2254,7 @@ app.get('/api/backup/history', requireAuth, async (req, res) => {
 });
 
 // 恢复备份
-app.post('/api/backup/restore/:id', requireAuth, async (req, res) => {
+app.post('/api/backup/restore/:id', requireAuth, requireAdmin, async (req, res) => {
     try {
         const backupId = req.params.id;
         
@@ -2490,7 +2423,8 @@ async function executeBackup(backupConfig, userId) {
         const timestamp = now.toISOString().replace(/[:.]/g, '-');
         
         // 创建备份文件夹名称：backup_{用户名}_{时间戳}
-        const backupFolderName = `backup_${username}_${timestamp}`;
+        // 子文件夹仅由服务器时间戳构成（不含用户名等库外数据，见 BACKUP_ROOT_DIR 安全说明）
+        const backupFolderName = `backup_${timestamp}`;
         
         // 按功能项分类数据
         const categorizedData = {
@@ -2537,8 +2471,7 @@ async function executeBackup(backupConfig, userId) {
             let jsonFilePath = null;
             if (backupType === 'local') {
                 jsonFilePath = await backupToLocalWithFolder(
-                    jsonContent, 
-                    config.path || './backups', 
+                    jsonContent,
                     backupFolderName,
                     jsonFileName
                 );
@@ -2564,8 +2497,7 @@ async function executeBackup(backupConfig, userId) {
                 let htmlFilePath = null;
                 if (backupType === 'local') {
                     htmlFilePath = await backupToLocalWithFolder(
-                        htmlContent, 
-                        config.path || './backups', 
+                        htmlContent,
                         backupFolderName,
                         htmlFileName
                     );
@@ -2664,16 +2596,30 @@ async function backupToLocal(data, backupPath, fileName) {
 }
 
 // 备份到本地/NAS（新版本，支持文件夹结构）
-async function backupToLocalWithFolder(fileContent, backupPath, folderName, fileName) {
+// 备份根目录：仅由部署环境决定（BACKUP_ROOT_DIR，默认 <项目>/backups），
+// 不接收任何请求输入。NAS 场景通过环境变量指向挂载目录或在 NAS 上挂载该目录。
+const BACKUP_ROOT_DIR = path.resolve(process.env.BACKUP_ROOT_DIR || path.join(__dirname, 'backups'));
+
+// 路径段清洗：拒绝空值、路径分隔符与相对引用，防止拼接出越界路径
+function sanitizeBackupPathSegment(segment, label) {
+    const value = String(segment ?? '').trim();
+    if (!value || value === '.' || value === '..' || value.includes('\0') || /[\\/]/.test(value)) {
+        throw new Error(`备份${label}包含非法字符: ${value}`);
+    }
+    return value;
+}
+
+async function backupToLocalWithFolder(fileContent, folderName, fileName) {
     try {
-        // 解析路径（支持绝对路径和相对路径）
-        const resolvedPath = path.isAbsolute(backupPath) 
-            ? backupPath 
-            : path.resolve(__dirname, backupPath);
-        
+        const safeFolderName = sanitizeBackupPathSegment(folderName, '文件夹名');
+        const safeFileName = sanitizeBackupPathSegment(fileName, '文件名');
+
+        // 备份根目录固定为部署环境配置的 BACKUP_ROOT_DIR，请求输入无法改变写入位置
+        const resolvedPath = BACKUP_ROOT_DIR;
+
         console.log('[BACKUP] 备份路径:', resolvedPath);
-        console.log('[BACKUP] 备份文件夹:', folderName);
-        console.log('[BACKUP] 文件名:', fileName);
+        console.log('[BACKUP] 备份文件夹:', safeFolderName);
+        console.log('[BACKUP] 文件名:', safeFileName);
         
         // 确保备份目录存在
         if (!fs.existsSync(resolvedPath)) {
@@ -2700,8 +2646,12 @@ async function backupToLocalWithFolder(fileContent, backupPath, folderName, file
             }
         }
         
-        // 创建备份文件夹
-        const folderPath = path.join(resolvedPath, folderName);
+        // 创建备份文件夹（内联越界校验：目标必须仍在 BACKUP_ROOT_DIR 内）
+        const folderPath = path.join(resolvedPath, safeFolderName);
+        const folderRel = path.relative(resolvedPath, folderPath);
+        if (folderRel.startsWith('..') || path.isAbsolute(folderRel)) {
+            throw new Error(`备份路径越界: ${folderPath}`);
+        }
         if (!fs.existsSync(folderPath)) {
             console.log('[BACKUP] 创建备份子文件夹:', folderPath);
             try {
@@ -2713,8 +2663,12 @@ async function backupToLocalWithFolder(fileContent, backupPath, folderName, file
             }
         }
         
-        // 写入文件
-        const filePath = path.join(folderPath, fileName);
+        // 写入文件（内联越界校验，同上）
+        const filePath = path.join(folderPath, safeFileName);
+        const fileRel = path.relative(resolvedPath, filePath);
+        if (fileRel.startsWith('..') || path.isAbsolute(fileRel)) {
+            throw new Error(`备份路径越界: ${filePath}`);
+        }
         console.log('[BACKUP] 写入备份文件:', filePath);
         try {
             fs.writeFileSync(filePath, fileContent, 'utf-8');
@@ -2879,9 +2833,6 @@ function matchesCronField(expr, value, min, max) {
 
 // 启动备份调度器
 initBackupScheduler();
-
-// 初始化 favicon 磁盘缓存（索引加载 + 目录创建）
-initFaviconDiskCache();
 
 // 静态文件服务（必须在所有API路由之后，避免拦截API请求）
 // 设置CSP头（不允许eval和unsafe-inline脚本，但允许内联样式；字体已改为系统字体栈，不再依赖外部源）
